@@ -10,6 +10,8 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
 from vllm.attention.ops.chunked_prefill_paged_decode import (
     chunked_prefill_paged_decode)
 from vllm.attention.ops.paged_attn import PagedAttention
+from vllm.attention.ops.triton_cache_update import (
+    triton_reshape_and_cache_flash)
 from vllm.attention.ops.triton_unified_attention import unified_attention
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -151,7 +153,6 @@ class TritonAttentionImpl(AttentionImpl):
         assert output is not None, "Output tensor must be provided."
 
         if attn_metadata is None:
-            # Profiling run.
             return output
 
         assert attn_metadata.use_cascade is False
@@ -189,16 +190,26 @@ class TritonAttentionImpl(AttentionImpl):
 
         else:
             key_cache, value_cache = kv_cache.unbind(0)
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+            is_kv_cache_fp8 = self.kv_cache_dtype.startswith("fp8")  # noqa
+            if True:  #is_kv_cache_fp8:
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+            else:
+                triton_reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                )
 
         if self.kv_cache_dtype.startswith("fp8"):
             key_cache = key_cache.view(self.fp8_dtype)
