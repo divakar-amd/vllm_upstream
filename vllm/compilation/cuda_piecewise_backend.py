@@ -166,6 +166,7 @@ class CUDAPiecewiseBackend:
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             entry.input_addresses = input_addresses
+            start_free_gpu_memory = torch.cuda.mem_get_info()[0]
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
@@ -196,7 +197,11 @@ class CUDAPiecewiseBackend:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
-
+            end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+            logger.info(
+                 "memory consumed for cudagraph capture: %.5f GB",
+                 (start_free_gpu_memory - end_free_gpu_memory) / 1e9
+            )
             compilation_counter.num_cudagraph_captured += 1
 
             # important: we need to return the output, rather than
