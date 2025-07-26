@@ -151,6 +151,7 @@ if TYPE_CHECKING:
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = False
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
+    VLLM_AITER_TRITON_FP8_BMM: bool = False
 
 
 def get_default_cache_root():
@@ -938,6 +939,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # limit will actually be zero-copy decoded.
     "VLLM_MSGPACK_ZERO_COPY_THRESHOLD":
     lambda: int(os.getenv("VLLM_MSGPACK_ZERO_COPY_THRESHOLD", "256")),
+    
+    "VLLM_AITER_TRITON_FP8_BMM":
+    lambda: bool(int(os.getenv("VLLM_AITER_TRITON_FP8_BMM", "0"))),
 
     # If set, allow insecure serialization using pickle.
     # This is useful for environments where it is deemed safe to use the
