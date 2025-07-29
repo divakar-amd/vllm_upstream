@@ -246,7 +246,7 @@ if envs.VLLM_AITER_TRITON_FP8_BMM:
         return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
-    @torch.compiler.disable
+    # @torch.compiler.disable
     def aiter_triton_fp8_bmm_wrapper(x, w, w_s, group_size = 128, y = None, transpose_bm = False):
         if y is not None:
             batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(x, w, w_s, group_size = group_size, YQ=y, transpose_bm=transpose_bm)
@@ -974,7 +974,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
         if envs.VLLM_AITER_TRITON_FP8_BMM:
             # Multiply + Transpose (N, B, L) x (N, L, V) -> (N, B, V) -> (B, N, V)
-            x = aiter_triton_fp8_bmm_wrapper(x, self.W_V, self.W_V_scale, group_size = 256, transpose_bm = True)
+            x = aiter_triton_fp8_bmm_wrapper(x, self.W_V, self.W_V_scale, group_size = 128, transpose_bm = True)
             # Convert from (B, N, V) to (B, N * V)
             x = x.reshape(-1, self.num_heads * self.v_head_dim)
         else:
@@ -1037,6 +1037,15 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             W_V = W_UV.permute(1, 2, 0) # 16 128 512
             self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(W_K, dtype=torch.float8_e4m3fnuz)
             self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(W_V, dtype=torch.float8_e4m3fnuz)
+            logger.info(f"[Triton] compiling fp8 BMM with shape = {self.W_K.shape[0]} [1~128] {self.W_K.shape[1]} {self.W_K.shape[2]}")
+            logger.info(f"[Triton] compiling fp8 BMM with shape = {self.W_V.shape[0]} [1~128] {self.W_V.shape[1]} {self.W_V.shape[2]}")
+            for m in range(1, 129):
+                x = torch.empty((self.W_K.shape[0], m, self.W_K.shape[2]), dtype=torch.bfloat16, device=self.W_K.device)
+                aiter_triton_fp8_bmm_wrapper(x, self.W_K, self.W_K_scale, group_size = 128, transpose_bm = True)
+
+                x = torch.empty((self.W_V.shape[0], m, self.W_V.shape[2]), dtype=torch.bfloat16, device=self.W_V.device)
+                aiter_triton_fp8_bmm_wrapper(x, self.W_V, self.W_V_scale, group_size = 128, transpose_bm = True)
+                
         else:
             # Convert from (L, N, V) to (N, L, V)
             self.W_UV = W_UV.transpose(0, 1)
