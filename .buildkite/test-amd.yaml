@@ -40,7 +40,7 @@ steps:
 - label: Language Models Tests (Extra Standard) %N
   timeout_in_minutes: 45
   mirror_hardwares: [amdexperimental]
-  agent_pool: mi325_2
+  agent_pool: mi325_8
   # grade: Blocking
   torch_nightly: true
   source_file_dependencies:
@@ -53,6 +53,8 @@ steps:
     # source is modified, or when specified test files are modified
     - pip freeze | grep -E 'torch'
     - export TORCH_NCCL_BLOCKING_WAIT=1
-    - pytest -vv -ra -s models/language -m 'core_model and slow_test' 
+    - pytest -v -s models/language -m 'core_model and slow_test' \
+             --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT \
+             --shard-id=$$BUILDKITE_PARALLEL_JOB
   parallelism: 2
 
