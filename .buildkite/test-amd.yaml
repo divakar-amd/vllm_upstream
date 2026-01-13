@@ -49,4 +49,7 @@ steps:
     - pip freeze | grep -E 'torch'
     - pytest -vv -rA -s models/language -m 'core_model and (not slow_test)'
     # - pytest -s -vv models/language/generation/test_common.py::test_models[True-True-5-32-TitanML/tiny-mixtral]
+  retry:
+    manual:
+      permit_on_passed: true
 
