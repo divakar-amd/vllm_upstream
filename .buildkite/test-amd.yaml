@@ -47,6 +47,6 @@ steps:
   commands:
     # Test standard language models, excluding a subset of slow tests
     - pip freeze | grep -E 'torch'
-    # - pytest -v -s models/language -m 'core_model and (not slow_test)'
-    - pytest -s -vv models/language/generation/test_common.py::test_models[True-True-5-32-TitanML/tiny-mixtral]
+    - pytest -vv -rA -s models/language -m 'core_model and (not slow_test)'
+    # - pytest -s -vv models/language/generation/test_common.py::test_models[True-True-5-32-TitanML/tiny-mixtral]
 
