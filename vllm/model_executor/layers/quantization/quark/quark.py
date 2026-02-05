@@ -28,6 +28,7 @@ from vllm.model_executor.layers.quantization.quark.schemes import (
     QuarkScheme,
     QuarkW8A8Fp8,
     QuarkW8A8Int8,
+    QuarkW4A8_MXFP4_FP8,
 )
 from vllm.model_executor.layers.quantization.quark.utils import (
     deep_compare,
@@ -320,6 +321,41 @@ class QuarkConfig(QuantizationConfig):
         # Only symmetric weight quantization supported.
         return is_int8_dtype and is_tensor and is_weight_symmetric and is_static
 
+    def _is_w4a8_mxfp4_fp8(
+        self,
+        weight_quant: dict[str, Any] | None,
+        input_quant: dict[str, Any] | None,
+    ) -> bool:
+        """Detect W4A8 with MXFP4 weights and FP8 activations."""
+        
+        # Confirm both are quantized
+        if weight_quant is None or input_quant is None:
+            # [DV todo] Improve error message
+            logger.debug("W4A8 with MXFP4 weights and FP8 activations: "
+             f"{weight_quant=}, {input_quant=} not set")
+            return False
+        
+        # Check weight is MXFP4 per-group with block size 32
+        # [DV todo] Segragate & add log msgs.
+        is_weight_mxfp4 = (
+            weight_quant.get("dtype") == "fp4" and
+            weight_quant.get("qscheme") == "per_group" and
+            weight_quant.get("group_size") == 32 and
+            weight_quant.get("scale_format") == "e8m0" and
+            not weight_quant.get("is_dynamic")
+        )
+        
+        # Check activation is FP8
+        # [DV todo] add log msgs.
+        is_input_fp8 = (
+            input_quant.get("dtype") == "fp8_e4m3" and    # [DV todo] "fp8_e3m4"??
+            input_quant.get("qscheme") in ["per_tensor", "per_channel"]
+            and not input_quant.get("is_dynamic")  # Static per-tensor          # [DV todo] Check on this.
+            and input_quant.get("symmetric") is True  # Symmetric quantization  # [DV todo] Need this check?
+        )
+        
+        return is_weight_mxfp4 and is_input_fp8
+
     def _is_ocp_mx(
         self,
         weight_quant: dict[str, Any] | None,
@@ -441,6 +477,12 @@ class QuarkConfig(QuantizationConfig):
                 is_static_input_scheme=True,
                 input_symmetric=input_config.get("symmetric"),
             )
+        elif self._is_w4a8_mxfp4_fp8(weight_config, input_config):
+            is_w4a8_supported = self._check_scheme_supported(
+                QuarkW4A8_MXFP4_FP8.get_min_capability(), error=False
+            )
+            if is_w4a8_supported:
+                return QuarkW4A8_MXFP4_FP8(weight_config, input_config)
         elif self._is_ocp_mx(weight_config, input_config):
             return QuarkOCP_MX(weight_config, input_config)
 
