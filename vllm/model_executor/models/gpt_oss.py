@@ -587,6 +587,20 @@ class GptOssModel(nn.Module):
                 param.data.copy_(narrow_weight)
                 loaded_params.add(name)
                 continue
+            # Handle quantization scale parameters (e.g., output_scale) before stacked_params_mapping
+            # [DV todo] understand this. This resolves KeyError'layers.12.attn.qkv_proj.output_scale'
+            if self.quant_config is not None and (
+                scale_name := self.quant_config.get_cache_scale(name)
+            ):
+                # Loading kv cache quantization scales
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                loaded_weight = (
+                    weight if weight.dim() == 0 else weight[0]
+                )
+                weight_loader(param, loaded_weight)
+                loaded_params.add(scale_name)
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -695,6 +709,7 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
             self.config.hidden_size,
+            quant_config=vllm_config.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
@@ -738,6 +753,8 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # [DV todo] Check later: assuming lm_head in not quantized in weights
+
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),

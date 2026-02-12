@@ -40,7 +40,7 @@ from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
 
-__all__ = ["QuarkMoEMethod", "QuarkW8A8Fp8MoEMethod", "QuarkOCP_MX_MoEMethod"]
+__all__ = ["QuarkMoEMethod", "QuarkW8A8Fp8MoEMethod", "QuarkOCP_MX_MoEMethod", "QuarkW4A8_MXFP4_FP8_MoEMethod"]
 
 
 class QuarkMoEMethod(FusedMoEMethodBase):
@@ -63,7 +63,10 @@ class QuarkMoEMethod(FusedMoEMethodBase):
             )
         weight_config = layer_quant_config.get("weight")
         input_config = layer_quant_config.get("input_tensors")
-        if quant_config._is_fp8_w4a8(weight_config, input_config):
+
+        if quant_config._is_w4a8_mxfp4_fp8(weight_config, input_config):
+            return QuarkW4A8_MXFP4_FP8_MoEMethod(weight_config, input_config, module.moe_config)
+        elif quant_config._is_fp8_w4a8(weight_config, input_config):
             return QuarkW4A8Fp8MoEMethod(weight_config, input_config, module.moe_config)
         elif quant_config._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8Fp8MoEMethod(weight_config, input_config, module.moe_config)
@@ -778,3 +781,518 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             )
 
         return out
+
+class QuarkW4A8_MXFP4_FP8_MoEMethod(QuarkMoEMethod):
+    """
+    MoE method for W4A8 with MXFP4 weights and FP8 activations.
+    
+    Uses AITER's moe_gemm_a8w4 kernel for efficient computation.
+    """
+    
+    def __init__(
+        self,
+        weight_config: dict[str, Any],
+        input_config: dict[str, Any],
+        moe: FusedMoEConfig,
+    ):
+        super().__init__(moe)
+        self.weight_quant = weight_config
+        self.input_quant = input_config
+        
+        # Validate configuration
+        weight_qscheme = self.weight_quant.get("qscheme")
+        input_qscheme = self.input_quant.get("qscheme")
+        
+        if weight_qscheme != "per_group":
+            raise ValueError(
+                f"W4A8 MXFP4+FP8 MoE requires per_group weight quantization, "
+                f"got {weight_qscheme}"
+            )
+        
+        if input_qscheme not in ["per_tensor", "per_channel"]:
+            raise ValueError(
+                f"W4A8 MXFP4+FP8 MoE requires per_tensor or per_channel "
+                f"activation quantization, got {input_qscheme}"
+            )
+        
+        self.static_input_scales = not self.input_quant.get("is_dynamic")
+        
+        # Check AITER availability
+        try:
+            from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4
+            self.AITER_AVAILABLE = True
+        except (ImportError, AttributeError):
+            self.AITER_AVAILABLE = False
+            logger.warning(
+                "AITER moe_gemm_a8w4 kernel not available. "
+                "MoE will use emulation mode."
+            )
+        # self.AITER_AVAILABLE = False # [DV todo] remove this.
+        
+        if self.AITER_AVAILABLE:
+            logger.info("W4A8 MXFP4+FP8 MoE will use AITER kernel.--------------------------------")
+        else:
+            logger.info("W4A8 MXFP4+FP8 MoE will use Emulation mode.--------------------------------")
+
+        self.use_rocm_aiter_moe = rocm_aiter_ops.is_fused_moe_enabled()
+        # For now, require AITER for native kernel
+        # Can add emulation mode later if needed
+        if not self.AITER_AVAILABLE:
+            logger.warning_once(
+                "W4A8 MXFP4+FP8 MoE will use emulation mode. "
+                "Install AITER for better performance."
+            )
+    
+    def get_packed_dim(self, dim: int) -> int:
+        """Calculate packed dimension for MXFP4 (2 values per byte)."""
+        assert dim % 2 == 0, f"Dimension {dim} must be even for MXFP4 packing"
+        return dim // 2
+    
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """
+        Create weight parameters for W4A8 MXFP4+FP8 MoE.
+        
+        Weights are stored as:
+        - w13_weight: (num_experts, 2*intermediate_size, hidden_size//2) uint8 (packed MXFP4)
+        - w2_weight: (num_experts, hidden_size, intermediate_size//2) uint8 (packed MXFP4)
+        - w13_weight_scale: (num_experts, 2*intermediate_size, hidden_size//32) uint8 (E8M0)
+        - w2_weight_scale: (num_experts, hidden_size, intermediate_size//32) uint8 (E8M0)
+        - w13_input_scale: (num_experts,) float32 (FP8 per-tensor scale)
+        - w2_input_scale: (num_experts,) float32 (FP8 per-tensor scale)
+        """
+        layer.intermediate_size_per_partition = intermediate_size_per_partition
+        layer.hidden_size = hidden_size
+        layer.num_experts = num_experts
+        layer.orig_dtype = params_dtype
+        
+        # Add quantization method metadata
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+        )
+        
+        params_dtype = torch.uint8  # Packed MXFP4
+        
+        # W13 WEIGHTS (gate + up projection, concatenated)
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                self.get_packed_dim(hidden_size),  # Packed dimension
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        
+        # W2 WEIGHTS (down projection)
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                self.get_packed_dim(intermediate_size_per_partition),  # Packed dimension
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+        
+        # W13 WEIGHT SCALES (E8M0, per block of 32)
+        w13_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // OCP_MX_BLOCK_SIZE,  # Blocks of 32
+                dtype=torch.uint8,  # E8M0 format
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        
+        # W2 WEIGHT SCALES (E8M0, per block of 32)
+        w2_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // OCP_MX_BLOCK_SIZE,  # Blocks of 32
+                dtype=torch.uint8,  # E8M0 format
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        
+        # INPUT SCALES (FP8 per-tensor, static)
+        if self.static_input_scales:
+            w13_input_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_input_scale", w13_input_scale)
+            set_weight_attrs(w13_input_scale, extra_weight_attrs)
+            
+            w2_input_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_input_scale", w2_input_scale)
+            set_weight_attrs(w2_input_scale, extra_weight_attrs)
+        else:
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+    
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """
+        Post-process weights after loading.
+        
+        For AITER kernel, we may need to:
+        1. Shuffle/swizzle weight scales (E8M0 format)
+        2. Prepare weights in the format expected by the kernel
+        """
+        # Process input scales first (needed for both AITER and emulation)
+        if self.static_input_scales:
+            if layer.w13_input_scale is None or layer.w2_input_scale is None:
+                raise ValueError(
+                    "QuantConfig has static quantization, but found "
+                    "activation scales are None."
+                )
+            
+            # Use max scale across experts (similar to W8A8Fp8MoEMethod)
+            if not all_close_1d(layer.w13_input_scale) or not all_close_1d(
+                layer.w2_input_scale
+            ):
+                logger.warning_once(
+                    "Found input_scales that are not equal for "
+                    "W4A8 MXFP4+FP8 MoE layer. Using the maximum across experts."
+                )
+            
+            layer.w13_input_scale = torch.nn.Parameter(
+                layer.w13_input_scale.max(), requires_grad=False
+            )
+            layer.w2_input_scale = torch.nn.Parameter(
+                layer.w2_input_scale.max(), requires_grad=False
+            )
+
+        # NOTE: Unlike QuarkOCP_MX_MoEMethod (which uses rocm_aiter_ops.fused_moe
+        # and requires pre-shuffled E8M0 scales), moe_gemm_a8w4's tl.dot_scaled
+        # expects raw (un-shuffled) E8M0 scales when swizzle_mx_scale=None.
+        # Therefore we do NOT apply e8m0_shuffle here.
+
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
+    ) -> FusedMoEQuantConfig | None:
+        """
+        Return quant config for fused MoE kernels.
+        
+        Note: AITER's moe_gemm_a8w4 may not use this config directly,
+        but we provide it for compatibility with the FusedMoE interface.
+        """
+        # For now, return None as AITER kernel handles quantization internally
+        # Can create a custom config if needed
+        return None
+    
+    def apply(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply W4A8 MXFP4+FP8 MoE forward pass using AITER kernel.
+        
+        Args:
+            layer: FusedMoE layer with w13_weight, w2_weight, scales
+            x: Input activations (BF16/FP16)
+            topk_weights: Router weights for top-k experts
+            topk_ids: Expert IDs for top-k experts
+        
+        Returns:
+            Output tensor
+        """
+        if self.AITER_AVAILABLE:
+            return self._apply_aiter_kernel(layer, x, topk_weights, topk_ids)
+        else:
+            return self._apply_emulation(layer, x, topk_weights, topk_ids)
+    
+    def _apply_aiter_kernel(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Use AITER's moe_gemm_a8w4 kernel for W4A8 MoE.
+
+        Flow:
+        1. Build RoutingData + gather/scatter indices from topk_ids/weights
+        2. Quantize input to FP8
+        3. First GEMM (w13 gate_up): gather by expert, no fused activation
+        4. Apply activation manually (handles swigluoai format correctly)
+        5. Apply router weights (gammas)
+        6. Requantize intermediate to FP8
+        7. Second GEMM (w2 down): scatter/reduce back to token order
+        """
+        from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4
+        from vllm.model_executor.layers.fused_moe.utils import (
+            apply_moe_activation,
+        )
+
+        # --- routing --------------------------------------------------
+        routing_data, gather_indx, scatter_indx = (
+            self._prepare_routing_data(layer, x, topk_weights, topk_ids)
+        )
+
+        # --- quantize input to FP8 ------------------------------------
+        x_fp8 = self._quantize_to_fp8(x, layer.w13_input_scale)
+
+        # --- transpose weights for kernel -----------------------------
+        # moe_gemm_a8w4 expects (E, K_packed, N) column-major
+        # (stride(-2)==1).  Our stored format is (E, N, K_packed) row-major.
+        # A simple .transpose(-1,-2) gives the right shape *and* strides.
+        w13 = layer.w13_weight.transpose(-1, -2)
+        w13_scales = layer.w13_weight_scale.transpose(-1, -2)
+        w2 = layer.w2_weight.transpose(-1, -2)
+        w2_scales = layer.w2_weight_scale.transpose(-1, -2)
+
+        # --- first GEMM: w13 (gate_up_proj) ---------------------------
+        # gather_indx sorts tokens by expert; scatter_indx=None keeps
+        # the output in expert-sorted order.
+        w13_output = moe_gemm_a8w4(
+            x=x_fp8,
+            w=w13,
+            x_scales=None,              # no per-token micro-scales
+            w_scales=w13_scales,
+            x_static_scale=layer.w13_input_scale,
+            routing_data=routing_data,
+            gather_indx=gather_indx,
+            scatter_indx=None,          # keep expert-sorted
+            gammas=None,                # apply after activation
+            out_dtype=layer.orig_dtype,
+            apply_swiglu=False,         # apply activation manually
+        )
+
+        # --- activation -----------------------------------------------
+        # w13_output: (n_tokens*topk, 2*intermediate)  expert-sorted
+        n_out = w13_output.shape[-1] // 2
+        act_output = torch.empty(
+            (w13_output.shape[0], n_out),
+            dtype=w13_output.dtype,
+            device=w13_output.device,
+        )
+        apply_moe_activation(layer.activation, act_output, w13_output)
+
+        # --- apply router weights (gammas) ----------------------------
+        # gate_scal is in expert-sorted order, one value per token-expert
+        act_output = act_output * routing_data.gate_scal.unsqueeze(-1)
+
+        # --- requantize intermediate to FP8 for w2 --------------------
+        w2_input_fp8 = self._quantize_to_fp8(act_output, layer.w2_input_scale)
+
+        # --- second GEMM: w2 (down_proj) ------------------------------
+        # scatter_indx reduces expert-sorted rows back to token order.
+        output = moe_gemm_a8w4(
+            x=w2_input_fp8,
+            w=w2,
+            x_scales=None,
+            w_scales=w2_scales,
+            x_static_scale=layer.w2_input_scale,
+            routing_data=routing_data,
+            gather_indx=None,           # already expert-sorted
+            scatter_indx=scatter_indx,  # reduce back to tokens
+            gammas=None,
+            out_dtype=layer.orig_dtype,
+            apply_swiglu=False,
+        )
+
+        return output
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _prepare_routing_data(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ):
+        """
+        Build AITER RoutingData + gather/scatter indices from vLLM's
+        topk_weights / topk_ids.
+
+        Follows the logic of AITER's ``routing_torch`` reference
+        implementation (aiter.ops.triton.moe_routing.routing).
+        """
+        import triton
+        from aiter.ops.triton.moe_routing.routing import (
+            RoutingData,
+            compute_expt_data_torch,
+        )
+
+        n_tokens, n_expts_act = topk_ids.shape
+        n_expts_tot = layer.num_experts
+        n_gates = n_tokens * n_expts_act
+
+        # 1. Sort expert selections within each token (for stable global sort)
+        expt_indx, sort_indices = torch.sort(topk_ids.int(), dim=1)
+        expt_scal = torch.gather(
+            topk_weights.float(), 1, sort_indices.long()
+        )
+
+        # 2. Flatten to 1-D arrays
+        expt_scal = expt_scal.reshape(-1)
+        expt_indx = expt_indx.reshape(-1).to(torch.int32)
+
+        # 3. Global sort by expert id
+        topk_indx = torch.argsort(expt_indx, stable=True)
+        gate_indx = torch.argsort(topk_indx, stable=True)
+        gate_scal = expt_scal[topk_indx]
+
+        # 4. Histogram (tokens per expert)
+        hist = torch.histc(
+            expt_indx.float(), bins=n_expts_tot, max=n_expts_tot - 1
+        ).int()
+
+        # 5. Block size
+        tokens_per_expt = max(1, n_gates // n_expts_tot)
+        block_m = max(
+            16, min(triton.next_power_of_2(tokens_per_expt), 128)
+        )
+
+        # 6. ExptData (offsets + block-pid map)
+        expt_data = compute_expt_data_torch(
+            hist, n_expts_tot, n_gates, block_m
+        )
+
+        # 7. Pack
+        routing_data = RoutingData(
+            block_m=block_m,
+            gate_scal=gate_scal,
+            expt_hist=hist,
+            n_expts_tot=n_expts_tot,
+            n_expts_act=n_expts_act,
+            expt_data=expt_data,
+        )
+        gather_indx = topk_indx.int()
+        scatter_indx = gate_indx.int()
+
+        return routing_data, gather_indx, scatter_indx
+
+    @staticmethod
+    def _quantize_to_fp8(
+        x: torch.Tensor, static_scale: torch.Tensor
+    ) -> torch.Tensor:
+        """Quantize *x* to FP8 E4M3 using a per-tensor static scale."""
+        scale_val = (
+            static_scale.item()
+            if static_scale.numel() == 1
+            else static_scale.max().item()
+        )
+        return (x / scale_val).clamp(-448, 448).to(torch.float8_e4m3fn)
+    
+    def _apply_emulation(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Emulation mode: dequantize weights and use vLLM's existing fused_experts.
+        
+        This approach:
+        1. Dequantizes MXFP4 weights to high precision (BF16/FP16)
+        2. Quantizes-dequantizes FP8 activations (simulates FP8 precision)
+        3. Uses vLLM's existing fused_experts which handles topk_weights/topk_ids
+        """
+        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+            dequant_mxfp4,
+        )
+        from vllm.model_executor.layers.fused_moe import fused_experts
+        
+        # Dequantize w13 weights (gate_up_proj) from MXFP4 to high precision
+        # w13_weight shape: (num_experts, 2*intermediate_size, hidden_size//2) uint8
+        # After dequant: (num_experts, 2*intermediate_size, hidden_size) bfloat16
+        w13_weight_dq = torch.zeros(
+            (layer.num_experts, 
+            2 * layer.intermediate_size_per_partition, 
+            layer.hidden_size),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        
+        # Dequantize each expert's weights
+        for expert_id in range(layer.num_experts):
+            w13_weight_dq[expert_id] = dequant_mxfp4(
+                layer.w13_weight[expert_id],
+                layer.w13_weight_scale[expert_id],
+                x.dtype,
+            )
+        
+        # Dequantize w2 weights (down_proj) from MXFP4 to high precision
+        # w2_weight shape: (num_experts, hidden_size, intermediate_size//2) uint8
+        # After dequant: (num_experts, hidden_size, intermediate_size) bfloat16
+        w2_weight_dq = torch.zeros(
+            (layer.num_experts,
+            layer.hidden_size,
+            layer.intermediate_size_per_partition),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        
+        for expert_id in range(layer.num_experts):
+            w2_weight_dq[expert_id] = dequant_mxfp4(
+                layer.w2_weight[expert_id],
+                layer.w2_weight_scale[expert_id],
+                x.dtype,
+            )
+        
+        # Simulate FP8 quantization-dequantization on activations
+        # For w13 input
+        if layer.w13_input_scale is not None:
+            w13_input_scale = layer.w13_input_scale.item()
+            x_fp8 = (x / w13_input_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+            x_dq = x_fp8.to(x.dtype) * w13_input_scale
+        else:
+            x_dq = x
+        
+        # Use vLLM's existing fused_experts which handles:
+        # - topk_weights and topk_ids routing
+        # - Expert selection and accumulation
+        # - SwiGLU activation
+        # - All the MoE complexity
+        
+        # Create a dummy quant_config for fused_experts
+        # (it won't use quantization since we've already dequantized)
+        from vllm.model_executor.layers.fused_moe.config import (
+            FUSED_MOE_UNQUANTIZED_CONFIG,
+        )
+        
+        output = fused_experts(
+            hidden_states=x_dq,
+            w1=w13_weight_dq,
+            w2=w2_weight_dq,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=False,
+            activation=layer.activation,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            quant_config=FUSED_MOE_UNQUANTIZED_CONFIG,  # No quantization needed
+        )
+        
+        return output
