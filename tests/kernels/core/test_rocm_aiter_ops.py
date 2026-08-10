@@ -1,22 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""ROCm AITER helper-op tests.
+"""ROCm AITER helper-op tests for CI stability.
 
-This file owns the ROCm AITER helper ops that do not already have a more
-specific home:
-- ``rms_norm`` and ``rms_norm2d_with_add``
-- ``triton_rotary_embedding``
-- ``per_token_quant`` and ``per_tensor_quant``
-- ``act_mul_and_fp8_group_quant``
-- the fused RMSNorm + quantization helper ops
+These tests directly validate AITER kernel correctness against PyTorch/reference
+implementations. They provide clear failure signals when AITER library updates
+introduce regressions, independent of vLLM's fusion/compilation passes.
 
-Ownership boundaries:
-- detailed ``group_fp8_quant`` coverage lives in
-  ``tests/kernels/quantization/test_rocm_aiter_grouped_quant.py``
-- broader ROCm FP8 reference comparisons live in
-  ``tests/kernels/quantization/rocm/test_rocm_fp8.py``
-- generic RMSNorm + quant fusion coverage lives in
-  ``tests/kernels/core/test_fused_quant_layernorm.py``
+Tested ops:
+- ``rms_norm`` and ``rms_norm2d_with_add`` vs PyTorch reference
+- ``triton_rotary_embedding`` vs manual NeoX RoPE reference (xfail - known issue)
+- ``act_mul_and_fp8_group_quant`` (SiGLU + FP8 group quant)
+- fused RMSNorm + quantization ops vs sequential composition
+
+Related coverage:
+- per-token/per-tensor quant roundtrips: ``tests/rocm/aiter/test_quant_op_schema.py``
+- RMSNorm determinism: ``tests/rocm/aiter/test_quant_op_schema.py``
+- group_fp8_quant: ``tests/kernels/quantization/test_rocm_aiter_grouped_quant.py``
 """
 
 import importlib
@@ -25,7 +24,6 @@ import warnings
 import pytest
 import torch
 
-from tests.kernels.utils import _assert_deterministic
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -163,6 +161,7 @@ def _assert_rel_error_quality(
 
     assert mean_rel < mean_limit, msg
     assert above_max_count / total <= max_fail_rate, msg
+
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_rocm_aiter_rms_norm_vs_torch(dtype):
@@ -320,65 +319,6 @@ def test_rocm_aiter_triton_rotary_embedding_vs_torch():
     )
 
 
-def test_rocm_aiter_per_token_quant_roundtrip():
-    """rocm_aiter_per_token_quant: dequantized output is close to original."""
-    require_aiter()
-    require_fp8()
-    from vllm._aiter_ops import rocm_aiter_ops
-
-    torch.set_default_device("cuda")
-    torch.manual_seed(1)
-
-    M, N = 32, 512
-    x = torch.randn(M, N, dtype=torch.bfloat16)
-    fp8_dtype = current_platform.fp8_dtype()
-
-    x_quant, scale = rocm_aiter_ops.per_token_quant(x, fp8_dtype)
-
-    # Dequantize: scale is [M] or [M, 1]
-    scale_exp = scale.view(M, 1).float()
-    x_dequant = x_quant.float() * scale_exp
-
-    _assert_rel_error_quality(
-        x_dequant,
-        x.float(),
-        label="per_token_quant",
-        mean_limit=0.05,
-        preferred_rel=0.05,
-        max_rel=0.5,
-        max_fail_rate=0.01,
-    )
-
-
-def test_rocm_aiter_per_tensor_quant_roundtrip():
-    """rocm_aiter_per_tensor_quant: dequantized output is close to original."""
-    require_aiter()
-    require_fp8()
-    from vllm._aiter_ops import rocm_aiter_ops
-
-    torch.set_default_device("cuda")
-    torch.manual_seed(2)
-
-    M, N = 32, 512
-    x = torch.randn(M, N, dtype=torch.bfloat16)
-    fp8_dtype = current_platform.fp8_dtype()
-
-    x_quant, scale = rocm_aiter_ops.per_tensor_quant(x, fp8_dtype)
-
-    # Dequantize: scale is scalar
-    x_dequant = x_quant.float() * scale.float()
-
-    _assert_rel_error_quality(
-        x_dequant,
-        x.float(),
-        label="per_tensor_quant",
-        mean_limit=0.05,
-        preferred_rel=0.05,
-        max_rel=0.5,
-        max_fail_rate=0.01,
-    )
-
-
 def test_rocm_aiter_act_mul_fp8_group_quant_roundtrip():
     """act_mul_and_fp8_group_quant: dequantized output matches SiLU gate reference."""
     require_aiter()
@@ -417,21 +357,6 @@ def test_rocm_aiter_act_mul_fp8_group_quant_roundtrip():
         max_fail_rate=0.01,
     )
 
-
-def test_rocm_aiter_rms_norm_determinism():
-    """rocm_aiter_rms_norm produces bitwise-identical results across N runs."""
-    require_aiter()
-    from vllm._aiter_ops import rocm_aiter_ops
-
-    torch.set_default_device("cuda")
-    torch.manual_seed(5)
-
-    M, N = 32, 512
-    x = torch.randn(M, N, dtype=torch.bfloat16)
-    weight = torch.ones(N, dtype=torch.bfloat16)
-    eps = 1e-5
-
-    _assert_deterministic(rocm_aiter_ops.rms_norm, x, weight, eps, n_runs=4)
 
 # -- Fused RMSNorm + quantization accuracy tests ---------------------------
 
@@ -649,6 +574,7 @@ def test_rocm_aiter_rmsnorm_with_add_fp8_group_quant_residual_accuracy():
 
 
 # -- End-to-end inference chain test ---------------------------------------
+
 
 def test_rocm_aiter_rms_norm_then_per_token_quant_e2e():
     """End-to-end: BF16 RMSNorm -> per-token FP8 quantization -> dequantize.
