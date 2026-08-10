@@ -18,12 +18,12 @@ Related coverage:
 - group_fp8_quant: ``tests/kernels/quantization/test_rocm_aiter_grouped_quant.py``
 """
 
-import importlib
 import warnings
 
 import pytest
 import torch
 
+import vllm._aiter_ops  # noqa: F401 - ensure ops are registered
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -31,10 +31,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _reload_envs():
-    import vllm.envs as envs
-
-    return importlib.reload(envs)
+@pytest.fixture(autouse=True)
+def setup_cuda_device():
+    """Set default device to CUDA and seed RNG for all tests."""
+    torch.set_default_device("cuda")
+    torch.manual_seed(0)
 
 
 def require_aiter():
@@ -64,6 +65,40 @@ def _quantile(values: torch.Tensor, q: float) -> float:
     if values.numel() == 0:
         return 0.0
     return torch.quantile(values, q).item()
+
+
+def _dequantize_grouped(
+    quantized: torch.Tensor, scales: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    """Expand per-group scales and dequantize to float32."""
+    M, N = quantized.shape
+    scales_expanded = scales.repeat_interleave(group_size, dim=1)[:, :N]
+    return quantized.float() * scales_expanded
+
+
+def _rms_norm_reference(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """RMSNorm reference implementation in float32."""
+    rms = x.float().pow(2).mean(-1, keepdim=True).add(eps).sqrt()
+    return x.float() / rms * weight.float()
+
+
+def _assert_quant_shapes(
+    x_quant: torch.Tensor,
+    scale: torch.Tensor,
+    M: int,
+    N: int,
+    fp8_dtype: torch.dtype,
+    num_groups: int | None = None,
+) -> None:
+    """Verify quantized output shapes and dtypes."""
+    assert x_quant.shape == (M, N)
+    assert x_quant.dtype == fp8_dtype
+    if num_groups is not None:
+        assert scale.shape == (M, num_groups)
+    else:
+        assert scale.shape == (M, 1)
 
 
 def _assert_close_budget(
@@ -169,16 +204,13 @@ def test_rocm_aiter_rms_norm_vs_torch(dtype):
     require_aiter()
     from vllm._aiter_ops import rocm_aiter_ops
 
-    torch.set_default_device("cuda")
-    torch.manual_seed(0)
     M, N = 8, 128
     x = torch.randn(M, N, dtype=dtype)
     weight = torch.ones(N, dtype=dtype)
     eps = 1e-5
 
     # Reference: float32 RMSNorm for precision
-    rms = x.float().pow(2).mean(-1, keepdim=True).add(eps).sqrt()
-    ref = (x.float() / rms * weight.float()).to(dtype)
+    ref = _rms_norm_reference(x, weight, eps).to(dtype)
 
     out = rocm_aiter_ops.rms_norm(x, weight, eps)
     _assert_close_budget(
@@ -198,9 +230,6 @@ def test_rocm_aiter_rmsnorm_with_add_vs_torch():
     require_aiter()
     from vllm._aiter_ops import rocm_aiter_ops
 
-    torch.set_default_device("cuda")
-    torch.manual_seed(0)
-
     M, N = 16, 256
     x = torch.randn(M, N, dtype=torch.bfloat16)
     residual = torch.randn(M, N, dtype=torch.bfloat16)
@@ -211,7 +240,7 @@ def test_rocm_aiter_rmsnorm_with_add_vs_torch():
     h = x.float() + residual.float()
     rms = h.pow(2).mean(-1, keepdim=True).add(eps).sqrt()
     ref_normed = (h / rms * weight.float()).to(torch.bfloat16)
-    ref_residual = (x.float() + residual.float()).to(torch.bfloat16)
+    ref_residual = h.to(torch.bfloat16)
 
     out, res_out = rocm_aiter_ops.rms_norm2d_with_add(x, residual, weight, eps)
 
@@ -250,10 +279,6 @@ def test_rocm_aiter_triton_rotary_embedding_vs_torch():
     half mirroring the first so the reference and kernel agree.
     """
     require_aiter()
-    import vllm._aiter_ops  # noqa: F401 - ensure op is registered
-
-    torch.set_default_device("cuda")
-    torch.manual_seed(0)
 
     num_tokens = 8
     num_heads = 4
@@ -323,10 +348,6 @@ def test_rocm_aiter_act_mul_fp8_group_quant_roundtrip():
     """act_mul_and_fp8_group_quant: dequantized output matches SiLU gate reference."""
     require_aiter()
     require_fp8()
-    import vllm._aiter_ops  # noqa: F401 - ensure op is registered
-
-    torch.set_default_device("cuda")
-    torch.manual_seed(3)
 
     M, N = 32, 512  # N even: N//2 gate, N//2 up
     group_size = 128
@@ -342,10 +363,7 @@ def test_rocm_aiter_act_mul_fp8_group_quant_roundtrip():
     up = x.float()[:, N_half:]
     ref = torch.sigmoid(gate) * gate * up  # SiGLU
 
-    # Dequantize: scale is [M, num_groups]
-    _num_groups = (N_half + group_size - 1) // group_size
-    scale_exp = scale.repeat_interleave(group_size, dim=1)[:, :N_half]
-    x_dequant = x_quant.float() * scale_exp
+    x_dequant = _dequantize_grouped(x_quant, scale, group_size)
 
     _assert_rel_error_quality(
         x_dequant,
@@ -370,11 +388,7 @@ def test_rocm_aiter_rmsnorm_fused_dynamic_quant_vs_sequential():
     """
     require_aiter()
     require_fp8()
-    import vllm._aiter_ops  # noqa: F401
     from vllm._aiter_ops import rocm_aiter_ops
-
-    torch.set_default_device("cuda")
-    torch.manual_seed(0)
 
     M, N = 32, 512
     x = torch.randn(M, N, dtype=torch.bfloat16)
@@ -391,11 +405,8 @@ def test_rocm_aiter_rmsnorm_fused_dynamic_quant_vs_sequential():
     fused_q, fused_scale = torch.ops.vllm.rocm_aiter_rmsnorm_fused_dynamic_quant(
         x, weight, eps, fp8_dtype
     )
+    _assert_quant_shapes(fused_q, fused_scale, M, N, fp8_dtype)
     fused_dequant = fused_q.float() * fused_scale.float()
-
-    assert fused_q.shape == (M, N)
-    assert fused_q.dtype == fp8_dtype
-    assert fused_scale.shape == (M, 1)
 
     # Fused vs sequential: both should recover RMSNorm output within FP8 error
     _assert_rel_error_quality(
@@ -418,11 +429,7 @@ def test_rocm_aiter_rmsnorm_fused_add_dynamic_quant_vs_reference():
     """
     require_aiter()
     require_fp8()
-    import vllm._aiter_ops  # noqa: F401
     from vllm._aiter_ops import rocm_aiter_ops
-
-    torch.set_default_device("cuda")
-    torch.manual_seed(1)
 
     M, N = 16, 256
     x = torch.randn(M, N, dtype=torch.bfloat16)
@@ -443,10 +450,7 @@ def test_rocm_aiter_rmsnorm_fused_add_dynamic_quant_vs_reference():
             x, residual, weight, eps, fp8_dtype
         )
     )
-
-    assert fused_q.shape == (M, N)
-    assert fused_q.dtype == fp8_dtype
-    assert fused_scale.shape == (M, 1)
+    _assert_quant_shapes(fused_q, fused_scale, M, N, fp8_dtype)
     assert fused_res_out.shape == (M, N)
 
     # Residual output matches x + residual
@@ -479,11 +483,7 @@ def test_rocm_aiter_rmsnorm_fp8_group_quant_vs_sequential():
     """
     require_aiter()
     require_fp8()
-    import vllm._aiter_ops  # noqa: F401
     from vllm._aiter_ops import rocm_aiter_ops
-
-    torch.set_default_device("cuda")
-    torch.manual_seed(2)
 
     M, N = 32, 512
     group_size = 128
@@ -497,17 +497,13 @@ def test_rocm_aiter_rmsnorm_fp8_group_quant_vs_sequential():
     fused_q, fused_scales = torch.ops.vllm.rocm_aiter_rmsnorm_fp8_group_quant(
         x, weight, eps, group_size
     )
-    assert fused_q.shape == (M, N)
-    assert fused_q.dtype == fp8_dtype
-    assert fused_scales.shape == (M, expected_groups)
+    _assert_quant_shapes(fused_q, fused_scales, M, N, fp8_dtype, expected_groups)
 
     # Dequantize and compare to reference: rms_norm -> group quant -> dequant
     normed = rocm_aiter_ops.rms_norm(x, weight, eps)
     ref_q, ref_scales = rocm_aiter_ops.group_fp8_quant(normed, group_size)
-    scales_exp = ref_scales.repeat_interleave(group_size, dim=1)[:, :N]
-    ref_dequant = ref_q.float() * scales_exp
-    fused_scales_exp = fused_scales.repeat_interleave(group_size, dim=1)[:, :N]
-    fused_dequant = fused_q.float() * fused_scales_exp
+    ref_dequant = _dequantize_grouped(ref_q, ref_scales, group_size)
+    fused_dequant = _dequantize_grouped(fused_q, fused_scales, group_size)
 
     _assert_rel_error_quality(
         fused_dequant,
@@ -524,11 +520,7 @@ def test_rocm_aiter_rmsnorm_with_add_fp8_group_quant_residual_accuracy():
     """Fused rmsnorm_with_add_fp8_group_quant residual output matches x + residual."""
     require_aiter()
     require_fp8()
-    import vllm._aiter_ops  # noqa: F401
     from vllm._aiter_ops import rocm_aiter_ops
-
-    torch.set_default_device("cuda")
-    torch.manual_seed(4)
 
     M, N = 16, 256
     group_size = 128
@@ -555,13 +547,10 @@ def test_rocm_aiter_rmsnorm_with_add_fp8_group_quant_residual_accuracy():
 
     # Dequantized quant output must match rms_norm(x + residual)
     h = ref_residual
-    rms = h.float().pow(2).mean(-1, keepdim=True).add(eps).sqrt()
-    ref_normed = (h.float() / rms * weight.float()).to(torch.bfloat16)
+    ref_normed = _rms_norm_reference(h, weight, eps).to(torch.bfloat16)
     ref_q, ref_scales = rocm_aiter_ops.group_fp8_quant(ref_normed, group_size)
-    ref_scales_exp = ref_scales.repeat_interleave(group_size, dim=1)[:, :N]
-    ref_dequant = ref_q.float() * ref_scales_exp
-    fused_scales_exp = fused_scales.repeat_interleave(group_size, dim=1)[:, :N]
-    fused_dequant = fused_q.float() * fused_scales_exp
+    ref_dequant = _dequantize_grouped(ref_q, ref_scales, group_size)
+    fused_dequant = _dequantize_grouped(fused_q, fused_scales, group_size)
     _assert_rel_error_quality(
         fused_dequant,
         ref_dequant,
@@ -587,9 +576,6 @@ def test_rocm_aiter_rms_norm_then_per_token_quant_e2e():
     require_fp8()
     from vllm._aiter_ops import rocm_aiter_ops
 
-    torch.set_default_device("cuda")
-    torch.manual_seed(0)
-
     # Llama-style hidden dim
     M, N = 32, 4096
     x = torch.randn(M, N, dtype=torch.bfloat16)
@@ -598,14 +584,14 @@ def test_rocm_aiter_rms_norm_then_per_token_quant_e2e():
     fp8_dtype = current_platform.fp8_dtype()
 
     # Float32 reference for the full chain
-    rms = x.float().pow(2).mean(-1, keepdim=True).add(eps).sqrt()
-    ref_normed_f32 = x.float() / rms * weight.float()
+    ref_normed_f32 = _rms_norm_reference(x, weight, eps)
 
     # AITER chain: RMSNorm -> per-token FP8 quant -> dequant
     normed = rocm_aiter_ops.rms_norm(x, weight, eps)
     x_q, scale = rocm_aiter_ops.per_token_quant(normed, fp8_dtype)
     x_dequant = x_q.float() * scale.float()  # scale: [M, 1]
 
+    _assert_quant_shapes(x_q, scale, M, N, fp8_dtype)
     # Dequantized result should match the float32 reference within FP8 quant error
     _assert_rel_error_quality(
         x_dequant,
@@ -616,10 +602,6 @@ def test_rocm_aiter_rms_norm_then_per_token_quant_e2e():
         max_rel=0.5,
         max_fail_rate=0.01,
     )
-    # Shape and dtype checks
-    assert x_q.shape == (M, N)
-    assert x_q.dtype == fp8_dtype
-    assert scale.shape == (M, 1)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -633,9 +615,6 @@ def test_rocm_aiter_rms_norm_then_group_fp8_quant_e2e(dtype):
     require_fp8()
     from vllm._aiter_ops import rocm_aiter_ops
 
-    torch.set_default_device("cuda")
-    torch.manual_seed(0)
-
     M, N = 16, 512
     group_size = 128
     x = torch.randn(M, N, dtype=dtype)
@@ -643,14 +622,12 @@ def test_rocm_aiter_rms_norm_then_group_fp8_quant_e2e(dtype):
     eps = 1e-5
 
     # Float32 reference
-    rms = x.float().pow(2).mean(-1, keepdim=True).add(eps).sqrt()
-    ref_normed_f32 = x.float() / rms * weight.float()
+    ref_normed_f32 = _rms_norm_reference(x, weight, eps)
 
     # AITER chain: RMSNorm -> group FP8 quant -> dequant
     normed = rocm_aiter_ops.rms_norm(x, weight, eps)
     x_fp8, scales = rocm_aiter_ops.group_fp8_quant(normed.bfloat16(), group_size)
-    scales_exp = scales.repeat_interleave(group_size, dim=1)[:, :N]
-    x_dequant = x_fp8.float() * scales_exp
+    x_dequant = _dequantize_grouped(x_fp8, scales, group_size)
 
     _assert_rel_error_quality(
         x_dequant,
