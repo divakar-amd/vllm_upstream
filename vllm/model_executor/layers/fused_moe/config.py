@@ -1415,6 +1415,14 @@ class FusedMoEConfig:
     # for any other model type. Resolved here, not in the forward path,
     # because get_current_vllm_config() isn't set there.
     use_mxfp4_w4a4_dsv4: bool = False
+    # Activation dtype the interleaved AITER MXFP4 MoE kernel quantizes this
+    # layer's input to, forwarded as `fused_moe(quant_dtype_a=...)`. `None`
+    # leaves the choice to AITER's own token-count heuristic
+    # (`AITER_BF16_FP8_MOE_BOUND`), which is what a layer whose activation
+    # nobody requested must do. Set by the MXFP4 quant methods rather than
+    # here: resolving it needs the layer's `targets` spec, which is only in
+    # scope once the quant method is built.
+    aiter_mxfp4_act_dtype: torch.dtype | None = None
 
     def __post_init__(self):
         from vllm._aiter_ops import rocm_aiter_ops

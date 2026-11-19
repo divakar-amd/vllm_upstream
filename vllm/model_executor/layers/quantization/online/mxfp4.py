@@ -22,11 +22,12 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     TRITON_BACKENDS,
     Mxfp4MoeBackend,
-    _backend_activation_key,
+    _effective_activation_key,
     convert_weight_to_mxfp4_moe_kernel_format,
     make_mxfp4_moe_kernel,
     make_mxfp4_moe_quant_config,
     mxfp4_round_up_hidden_size_and_intermediate_size,
+    resolve_aiter_mxfp4_act_dtype,
     select_mxfp4_moe_backend,
 )
 from vllm.model_executor.layers.quantization.input_hadamard import (
@@ -184,7 +185,9 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
         backend_key = (
             kMxfp4Dynamic
             if self.mxfp4_backend == Mxfp4MoeBackend.EMULATION
-            else _backend_activation_key(self.mxfp4_backend)
+            else _effective_activation_key(
+                self.mxfp4_backend, self.activation_quant_key, self.moe
+            )
         )
         if (
             self.activation_quant_key != kMxfp4Dynamic
@@ -195,6 +198,21 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
                 f"activation={self.activation_quant_key}; it computes "
                 f"activation={backend_key}."
             )
+        # `convert_weight_to_mxfp4_moe_kernel_format` used to force this
+        # layout's activations to FP8 process-wide; keep that for layers nobody
+        # asked about, and honour the ones they did ask about.
+        # `resolve_quant_method_cls` already folded the user's request into
+        # `activation_quant_key`, leaving the class default when there was none,
+        # and the online `get_quant_method` opens no `layer_target_spec_scope`
+        # for the resolver to read -- so say outright whether one was made.
+        self.moe.aiter_mxfp4_act_dtype = resolve_aiter_mxfp4_act_dtype(
+            self.mxfp4_backend,
+            self.moe,
+            self.activation_quant_key,
+            pins_fp8=True,
+            activation_requested=self.activation_quant_key
+            != type(self).activation_quant_key,
+        )
 
     def maybe_roundup_sizes(
         self,

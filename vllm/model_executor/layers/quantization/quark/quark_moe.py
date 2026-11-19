@@ -56,6 +56,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     make_mxfp4_moe_kernel,
     make_mxfp4_moe_quant_config,
     mxfp4_round_up_hidden_size_and_intermediate_size,
+    resolve_aiter_mxfp4_act_dtype,
     select_mxfp4_moe_backend,
     triton_weight,
 )
@@ -1681,6 +1682,12 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
 
         logger.info_once(
             f"Using {self.mxfp4_backend.value} backend for {self.ocp_mx_scheme}"
+        )
+        # `convert_weight_to_mxfp4_moe_kernel_format` used to force this
+        # layout's activations to FP8 process-wide; keep that for layers nobody
+        # asked about, and honour the ones they did ask about.
+        moe.aiter_mxfp4_act_dtype = resolve_aiter_mxfp4_act_dtype(
+            self.mxfp4_backend, moe, activation_quant_key, pins_fp8=True
         )
 
     def maybe_roundup_sizes(

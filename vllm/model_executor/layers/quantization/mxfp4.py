@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     make_mxfp4_moe_kernel,
     make_mxfp4_moe_quant_config,
     mxfp4_round_up_hidden_size_and_intermediate_size,
+    resolve_aiter_mxfp4_act_dtype,
     select_deepseek_v4_mxfp4_moe_backend,
     select_mxfp4_moe_backend,
     triton_weight,
@@ -157,6 +158,11 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         super().__init__(moe)
         self.weight_dtype = "gpt_oss_mxfp4"
         self.mxfp4_backend, self.experts_cls = select_mxfp4_moe_backend(moe)
+        # gpt-oss has its own weight converter, which never pinned the AITER
+        # activation bound, so with no request this layer keeps deferring to it.
+        moe.aiter_mxfp4_act_dtype = resolve_aiter_mxfp4_act_dtype(
+            self.mxfp4_backend, moe
+        )
 
         self.max_capture_size = moe.max_capture_size
 
@@ -676,12 +682,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if rocm_aiter_ops.is_fused_moe_situv2_enabled():
                 # a16w4 does not read this bound. Force 0 so leftover a8w4
                 # config cannot keep bf16 activations.
-                # TODO: Remove once AITER takes this as a kernel argument.
+                # Unlike the interleaved layout, this stays an env write:
+                # SiTUv2 picks its own `q_dtype_a`, so there is no per-layer
+                # value to carry here, and the Kimi-K3 recipes export this
+                # bound themselves.
                 os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
         else:
             self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(
                 moe
             )
+        # `convert_weight_to_mxfp4_moe_kernel_format` used to force this
+        # layout's activations to FP8 process-wide; keep that for layers nobody
+        # asked about, and honour the ones they did ask about.
+        moe.aiter_mxfp4_act_dtype = resolve_aiter_mxfp4_act_dtype(
+            self.mxfp4_backend, moe, self.activation_key, pins_fp8=True
+        )
 
         self.max_capture_size = moe.max_capture_size
 

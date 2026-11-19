@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt4Static32,
     kMxfp4Dynamic,
     kMxfp4Static,
+    kMxfp8Dynamic,
 )
 
 if TYPE_CHECKING:
@@ -348,11 +349,17 @@ def mxfp4_w4a16_extra_kwargs(
             "bias1": quant_config.w1_bias,
             "bias2": quant_config.w2_bias,
         }
-    return {
+    kwargs = {
         "gate_mode_override": GateMode.INTERLEAVE.value,
         "bias1": quant_config.w1_bias,
         "bias2": quant_config.w2_bias,
     }
+    # Per-layer activation dtype, resolved by the quant method. Left unset when
+    # nobody asked, so `aiter.fused_moe` keeps picking bf16 vs fp8 from the
+    # process-wide AITER_BF16_FP8_MOE_BOUND it already owns.
+    if moe_config.aiter_mxfp4_act_dtype is not None:
+        kwargs["q_dtype_a"] = moe_config.aiter_mxfp4_act_dtype
+    return kwargs
 
 
 def rocm_aiter_fused_experts(
@@ -773,6 +780,9 @@ class AiterMxfp4Experts(AiterExperts):
         SUPPORTED_W_A = [
             (kMxfp4Static, None),
             (kMxfp4Static, kMxfp4Dynamic),
+            # The interleaved layout takes the activation dtype as a kernel
+            # argument (`quant_dtype_a`), so it runs MXFP8 as well as BF16.
+            (kMxfp4Static, kMxfp8Dynamic),
         ]
         if (weight_key, activation_key) not in SUPPORTED_W_A:
             return False
