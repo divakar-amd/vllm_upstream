@@ -31,7 +31,10 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8Dynamic128Sym,
+    kMxfp8Dynamic,
+)
 from vllm.platforms import current_platform
 
 ROCM_GFX950 = False
@@ -250,6 +253,34 @@ def test_other_backends_are_untouched(default_vllm_config):
         )
 
 
+@requires_gfx950_aiter
+@pytest.mark.parametrize("layout", ["situ", "dsv4"])
+def test_layouts_that_choose_their_own_activation_are_left_alone(
+    default_vllm_config, monkeypatch, layout
+):
+    """SiTUv2 and DeepSeek-V4 a4w4 pass their own `q_dtype_a` and have their own
+    tuned configs, so this resolver must not speak for them -- with or without a
+    request."""
+    config = _make_moe_config()
+    if layout == "situ":
+        config.activation = MoEActivation.SITU
+    else:
+        config.use_mxfp4_w4a4_dsv4 = True
+    assert (
+        resolve_aiter_mxfp4_act_dtype(
+            Mxfp4MoeBackend.AITER_MXFP4_BF16, config, pins_fp8=True
+        )
+        is None
+    )
+    _request_activation(monkeypatch, kMxfp8Dynamic)
+    assert (
+        resolve_aiter_mxfp4_act_dtype(
+            Mxfp4MoeBackend.AITER_MXFP4_BF16, config, kMxfp8Dynamic, pins_fp8=True
+        )
+        is None
+    )
+
+
 # -- Loud, not silent ---------------------------------------------------------
 
 
@@ -286,6 +317,29 @@ def test_fhmoe_shared_experts_reject_a_bf16_request(default_vllm_config, monkeyp
             Mxfp4MoeBackend.AITER_MXFP4_BF16, config, kMxfp8Dynamic
         )
         is dtypes.fp8
+    )
+
+
+@requires_gfx950_aiter
+def test_unservable_request_is_not_substituted(default_vllm_config, monkeypatch):
+    """Block-FP8 activations are not something this layout can execute. Backend
+    selection reports that; the resolver must not quietly pick some other dtype,
+    it must leave the layer exactly as it ran before the request existed."""
+    from aiter import dtypes
+
+    config = _make_moe_config()
+    _request_activation(monkeypatch, kFp8Dynamic128Sym)
+    assert (
+        resolve_aiter_mxfp4_act_dtype(
+            Mxfp4MoeBackend.AITER_MXFP4_BF16, config, kFp8Dynamic128Sym, pins_fp8=True
+        )
+        is dtypes.fp8
+    )
+    assert (
+        resolve_aiter_mxfp4_act_dtype(
+            Mxfp4MoeBackend.AITER_MXFP4_BF16, config, kFp8Dynamic128Sym
+        )
+        is None
     )
 
 

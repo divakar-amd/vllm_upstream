@@ -571,33 +571,19 @@ def _aiter_mxfp4_serves_activation(
     return activation_key == kMxfp8Dynamic and on_gfx950()
 
 
-def _aiter_mxfp4_act_dtype(
-    config: "FusedMoEConfig", activation_key: QuantKey | None
-) -> "torch.dtype | None":
-    """`fused_moe(quant_dtype_a=...)` running `activation_key` on the
-    interleaved AITER MXFP4 layout, or None if this layer cannot run it there."""
-    if not _aiter_mxfp4_serves_activation(config, activation_key):
-        return None
-
-    from aiter import dtypes
-
-    return dtypes.bf16 if activation_key is None else dtypes.fp8
-
-
 def _effective_activation_key(
     backend: Mxfp4MoeBackend,
     requested_activation_key: QuantKey | None,
-    config: "FusedMoEConfig | None" = None,
+    config: "FusedMoEConfig",
 ) -> QuantKey | None:
     """The activation key `backend` computes for this layer.
 
     Same as `_backend_activation_key` except on the interleaved AITER MXFP4
-    layout, which serves whichever of BF16/MXFP8 was asked for. Pass `config`
-    wherever the layer is known; without it this degrades to the fixed map."""
-    if (
-        config is not None
-        and backend == Mxfp4MoeBackend.AITER_MXFP4_BF16
-        and _aiter_mxfp4_serves_activation(config, requested_activation_key)
+    layout, which serves whichever of BF16/MXFP8 was asked for. `config` is
+    required: defaulting it would silently fall back to the fixed map, i.e.
+    drop a request this layer can actually serve."""
+    if backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and _aiter_mxfp4_serves_activation(
+        config, requested_activation_key
     ):
         return requested_activation_key
     return _backend_activation_key(backend)
@@ -618,11 +604,11 @@ def resolve_aiter_mxfp4_act_dtype(
     leaves that heuristic in charge, which is what a layer nobody made a
     request for must do -- including honouring a bound the user exported.
 
-    `pins_fp8` says this layer's weight converter used to force the bound to 0,
-    i.e. FP8 activations at every token count; keep that as its "no request"
-    answer so those deployments are unchanged. True for everything converted by
-    `convert_weight_to_mxfp4_moe_kernel_format`, false for gpt-oss, which has
-    its own converter and never wrote the bound.
+    `pins_fp8` says this layer's weights go through
+    `convert_weight_to_mxfp4_moe_kernel_format`, which forced the bound to 0 --
+    FP8 activations at every token count. Keep that as the layer's "no request"
+    answer so those deployments are unchanged. Callers that reach the kernel by
+    another converter (gpt-oss, the gfx942 int4 requant) must leave it False.
 
     `activation_requested` says whether the user asked for an activation at all,
     for callers that already know. Leave it None to read the layer's
@@ -646,13 +632,13 @@ def resolve_aiter_mxfp4_act_dtype(
     if not activation_requested:
         return default
     requested_key = _resolve_activation_key(model_activation_key)
-    dtype = _aiter_mxfp4_act_dtype(config, requested_key)
-    if dtype is None:
+    if not _aiter_mxfp4_serves_activation(config, requested_key):
         # Not something the interleaved layout can execute. Backend selection
         # already reports the unservable request; don't quietly substitute a
         # different activation here, just keep what this layout did before the
         # request was expressible.
         return default
+    dtype = dtypes.bf16 if requested_key is None else dtypes.fp8
 
     from vllm._aiter_ops import rocm_aiter_ops
     from vllm.config.quantization import quant_key_name
@@ -719,7 +705,7 @@ def _applies_requested_activation(
 def _warn_on_bf16_fallback(
     backend: Mxfp4MoeBackend,
     requested_activation_key: QuantKey | None,
-    config: FusedMoEConfig | None = None,
+    config: FusedMoEConfig,
 ) -> None:
     if (
         requested_activation_key is not None
@@ -774,7 +760,7 @@ def _requested_kernel_cls(
 def _filter_by_activation(
     backends: list[Mxfp4MoeBackend],
     requested_activation_key: QuantKey | None,
-    config: FusedMoEConfig | None = None,
+    config: FusedMoEConfig,
 ) -> list[Mxfp4MoeBackend]:
     """Pick variants matching `requested_activation_key`, followed by BF16
     variants as a higher-precision fallback unless VLLM_STRICT_QUANT_SCHEME
@@ -803,7 +789,7 @@ def _filter_by_activation(
 def _get_requested_backends(
     runner_backend: MoEBackend,
     requested_activation_key: QuantKey | None,
-    config: FusedMoEConfig | None = None,
+    config: FusedMoEConfig,
 ) -> list[Mxfp4MoeBackend]:
     backends = map_mxfp4_backend(runner_backend)
     if runner_backend == "b12x":
@@ -956,7 +942,7 @@ def select_deepseek_v4_mxfp4_moe_backend(
     runner_backend = config.moe_backend
     if runner_backend != "auto":
         if runner_backend == "b12x":
-            requested_backends = _get_requested_backends(runner_backend, None)
+            requested_backends = _get_requested_backends(runner_backend, None, config)
         else:
             # Try every variant of the alias in priority order. Narrowing to
             # the BF16 variant would drop SM100+ W4A8 variants on devices where
@@ -1996,13 +1982,9 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2.is_shuffled = True
             return (w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
 
-        # This used to set AITER_BF16_FP8_MOE_BOUND=0 here, pinning FP8
-        # activations for every INTERLEAVE layer in the process -- including
-        # layers belonging to a different quant method, loaded later. The quant
-        # methods now carry the same decision per layer in
-        # `FusedMoEConfig.aiter_mxfp4_act_dtype`; see
-        # `resolve_aiter_mxfp4_act_dtype(pins_fp8=True)`.
-
+        # The INTERLEAVE activation dtype is a per-layer decision, carried on
+        # `FusedMoEConfig.aiter_mxfp4_act_dtype` by the quant methods; see
+        # `resolve_aiter_mxfp4_act_dtype`. Don't set a process-wide bound here.
         from aiter.ops.shuffle import shuffle_scale as _shuf_s
         from aiter.ops.shuffle import shuffle_weight as _shuf_w
 

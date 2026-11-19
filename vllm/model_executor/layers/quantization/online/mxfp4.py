@@ -198,9 +198,6 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
                 f"activation={self.activation_quant_key}; it computes "
                 f"activation={backend_key}."
             )
-        # `convert_weight_to_mxfp4_moe_kernel_format` used to force this
-        # layout's activations to FP8 process-wide; keep that for layers nobody
-        # asked about, and honour the ones they did ask about.
         # `resolve_quant_method_cls` already folded the user's request into
         # `activation_quant_key`, leaving the class default when there was none,
         # and the online `get_quant_method` opens no `layer_target_spec_scope`

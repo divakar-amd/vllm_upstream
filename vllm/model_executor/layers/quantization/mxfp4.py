@@ -691,11 +691,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(
                 moe
             )
-        # `convert_weight_to_mxfp4_moe_kernel_format` used to force this
-        # layout's activations to FP8 process-wide; keep that for layers nobody
-        # asked about, and honour the ones they did ask about.
+        # The gfx942 int4 requant returns from `_setup_kernel_k3_situ_gfx942`
+        # without running `convert_weight_to_mxfp4_moe_kernel_format`, so it is
+        # the one layer here that never carried that converter's FP8 pin.
         moe.aiter_mxfp4_act_dtype = resolve_aiter_mxfp4_act_dtype(
-            self.mxfp4_backend, moe, self.activation_key, pins_fp8=True
+            self.mxfp4_backend,
+            moe,
+            self.activation_key,
+            pins_fp8=not self.is_k3_situ_int4_gfx942,
         )
 
         self.max_capture_size = moe.max_capture_size

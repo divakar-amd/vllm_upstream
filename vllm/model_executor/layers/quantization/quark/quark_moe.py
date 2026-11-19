@@ -1683,11 +1683,14 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         logger.info_once(
             f"Using {self.mxfp4_backend.value} backend for {self.ocp_mx_scheme}"
         )
-        # `convert_weight_to_mxfp4_moe_kernel_format` used to force this
-        # layout's activations to FP8 process-wide; keep that for layers nobody
-        # asked about, and honour the ones they did ask about.
+        # gpt-oss goes through `convert_gpt_oss_weight_to_mxfp4_moe_kernel_format`
+        # (see `_setup_kernel`), so it never carried the FP8 pin that
+        # `convert_weight_to_mxfp4_moe_kernel_format` applied.
         moe.aiter_mxfp4_act_dtype = resolve_aiter_mxfp4_act_dtype(
-            self.mxfp4_backend, moe, activation_quant_key, pins_fp8=True
+            self.mxfp4_backend,
+            moe,
+            activation_quant_key,
+            pins_fp8=self.model_type != "gpt_oss",
         )
 
     def maybe_roundup_sizes(
